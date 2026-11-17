@@ -45,9 +45,8 @@ CREATE TABLE IF NOT EXISTS entitlements (
 );
 `);
 
-// Safely add Cyzora columns to existing databases.
 const columns = db.prepare("PRAGMA table_info(payments)").all();
-const columnNames = columns.map(column => column.name);
+const columnNames = columns.map(c => c.name);
 
 if (!columnNames.includes("provider")) {
   db.exec("ALTER TABLE payments ADD COLUMN provider TEXT NOT NULL DEFAULT 'mpesa'");
@@ -79,21 +78,29 @@ app.use("/api/", rateLimit({
   legacyHeaders: false
 }));
 
-// Verify Cyzora's signature against the RAW body before JSON parsing.
+// CYZORA WEBHOOK
+// Verify the signature using the raw request body before parsing JSON.
 app.post(
   "/api/cyzora/webhook",
   express.raw({ type: "application/json", limit: "100kb" }),
   (req, res) => {
     try {
       const secret = process.env.CYZORA_WEBHOOK_SECRET;
+
       if (!secret) {
-        return res.status(503).json({ error: "Webhook secret is not configured." });
+        return res.status(503).json({
+          error: "Webhook secret is not configured."
+        });
       }
 
-      const signature = String(req.get("X-Cyzora-Signature") || "");
+      const signature = String(
+        req.get("X-Cyzora-Signature") || ""
+      );
 
       if (!/^[a-f0-9]{64}$/i.test(signature)) {
-        return res.status(401).json({ error: "Invalid webhook signature." });
+        return res.status(401).json({
+          error: "Invalid webhook signature."
+        });
       }
 
       const expected = crypto
@@ -107,7 +114,9 @@ app.post(
         received.length !== expected.length ||
         !crypto.timingSafeEqual(received, expected)
       ) {
-        return res.status(401).json({ error: "Invalid webhook signature." });
+        return res.status(401).json({
+          error: "Invalid webhook signature."
+        });
       }
 
       const event = JSON.parse(req.body.toString("utf8"));
@@ -116,18 +125,34 @@ app.post(
         return res.status(200).json({ received: true });
       }
 
+      // Find the order using the charge ID, Cyzora reference,
+      // or our original account_ref/order reference.
+      const findPayment = () => db.prepare(`
+        SELECT * FROM payments
+        WHERE provider = 'cyzora'
+        AND (
+          cyzora_charge_id = ?
+          OR cyzora_reference = ?
+          OR merchant_request_id = ?
+        )
+        LIMIT 1
+      `).get(
+        event.charge_id || "",
+        event.reference || "",
+        event.account_ref || ""
+      );
+
       if (event.event === "charge.succeeded") {
-        const payment = db.prepare(`
-          SELECT * FROM payments
-          WHERE provider = 'cyzora'
-          AND (cyzora_charge_id = ? OR cyzora_reference = ?)
-        `).get(event.charge_id || "", event.reference || "");
+        const payment = findPayment();
 
         if (!payment) {
-          // Acknowledge unrelated events; do not activate an unknown order.
-          return res.status(200).json({ received: true, matched: false });
+          return res.status(200).json({
+            received: true,
+            matched: false
+          });
         }
 
+        // Cyzora reports amounts in cents.
         const paidAmount = Number(event.amount);
         const expectedAmount = payment.amount * 100;
 
@@ -137,21 +162,24 @@ app.post(
           event.status !== "succeeded"
         ) {
           db.prepare(`
-            UPDATE payments SET status = 'review'
+            UPDATE payments
+            SET status = 'review'
             WHERE id = ? AND status = 'pending'
           `).run(payment.id);
 
-          return res.status(200).json({ received: true, review: true });
+          return res.status(200).json({
+            received: true,
+            review: true
+          });
         }
 
-        // Idempotent: duplicate webhooks cannot grant the package twice.
-        const update = db.prepare(`
+        // Only a pending order can become paid.
+        // This prevents duplicate webhooks granting packages twice.
+        const result = db.prepare(`
           UPDATE payments
           SET status = 'paid', mpesa_receipt = ?
           WHERE id = ? AND status = 'pending'
-        `);
-
-        const result = update.run(event.mpesa_receipt || null, payment.id);
+        `).run(event.mpesa_receipt || null, payment.id);
 
         if (result.changes === 1) {
           const pkg = PACKAGES[payment.package_code];
@@ -161,7 +189,11 @@ app.post(
               INSERT INTO entitlements
               (phone, package_code, analyses_total)
               VALUES (?, ?, ?)
-            `).run(payment.phone, payment.package_code, pkg.analyses);
+            `).run(
+              payment.phone,
+              payment.package_code,
+              pkg.analyses
+            );
           }
         }
       }
@@ -170,33 +202,44 @@ app.post(
         event.event === "charge.failed" ||
         event.event === "charge.expired"
       ) {
-        db.prepare(`
-          UPDATE payments SET status = 'failed'
-          WHERE provider = 'cyzora'
-          AND status = 'pending'
-          AND (cyzora_charge_id = ? OR cyzora_reference = ?)
-        `).run(event.charge_id || "", event.reference || "");
+        const payment = findPayment();
+
+        if (payment) {
+          db.prepare(`
+            UPDATE payments
+            SET status = 'failed'
+            WHERE id = ? AND status = 'pending'
+          `).run(payment.id);
+        }
       }
 
-      // Cyzora considers any 2xx response a successful delivery.
       return res.status(200).json({ received: true });
 
     } catch (error) {
       console.error("Cyzora webhook error:", error.message);
-      return res.status(400).json({ error: "Invalid webhook payload." });
+
+      return res.status(400).json({
+        error: "Invalid webhook payload."
+      });
     }
   }
 );
 
-// Normal JSON parsing happens after the raw-body webhook route.
+// Normal JSON parsing happens after the raw webhook route.
 app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 function normalizePhone(input) {
   let phone = String(input || "").replace(/[^\d+]/g, "");
 
-  if (phone.startsWith("+")) phone = phone.slice(1);
-  if (phone.startsWith("0")) phone = "254" + phone.slice(1);
+  if (phone.startsWith("+")) {
+    phone = phone.slice(1);
+  }
+
+  if (phone.startsWith("0")) {
+    phone = "254" + phone.slice(1);
+  }
+
   if (phone.startsWith("7") || phone.startsWith("1")) {
     phone = "254" + phone;
   }
@@ -216,44 +259,83 @@ function auth(req, res, next) {
     req.user = jwt.verify(token, process.env.JWT_SECRET);
     next();
   } catch {
-    res.status(401).json({ error: "Authentication required." });
+    res.status(401).json({
+      error: "Authentication required."
+    });
   }
 }
 
 function adminOnly(req, res, next) {
   if (req.user?.role !== "admin") {
-    return res.status(403).json({ error: "Admin access only." });
+    return res.status(403).json({
+      error: "Admin access only."
+    });
   }
+
   next();
 }
 
+// PACKAGES
 app.get("/api/packages", (_req, res) => {
   res.json(PACKAGES);
 });
 
-// Cyzora M-Pesa STK Push.
+// CYZORA M-PESA STK PUSH
 app.post("/api/payments/stk", async (req, res) => {
+  let orderReference;
+  let paymentId;
+
   try {
     const phone = normalizePhone(req.body.phone);
     const packageCode = String(req.body.packageCode || "");
     const pkg = PACKAGES[packageCode];
 
     if (!pkg) {
-      return res.status(400).json({ error: "Choose a valid package." });
+      return res.status(400).json({
+        error: "Choose a valid package."
+      });
     }
 
     const secretKey = process.env.CYZORA_SECRET_KEY;
 
     if (!secretKey) {
       return res.status(503).json({
-        error: "Cyzora is not configured. Contact the site administrator."
+        error: "Cyzora is not configured. Contact the administrator."
       });
     }
 
-    const orderReference =
-      "GW-" + Date.now() + "-" + crypto.randomBytes(4).toString("hex");
+    orderReference =
+      "GW-" + Date.now() + "-" +
+      crypto.randomBytes(4).toString("hex");
 
-    // Cyzora amounts are cents: KSh 500 = 50000.
+    // Save the order BEFORE contacting Cyzora.
+    // This prevents a fast webhook arriving before the order exists.
+    const insert = db.prepare(`
+      INSERT INTO payments (
+        merchant_request_id,
+        phone,
+        amount,
+        package_code,
+        status,
+        provider
+      )
+      VALUES (?, ?, ?, ?, 'pending', 'cyzora')
+    `).run(
+      orderReference,
+      phone,
+      pkg.amount,
+      packageCode
+    );
+
+    paymentId = insert.lastInsertRowid;
+
+    db.prepare(`
+      INSERT OR IGNORE INTO customers(phone)
+      VALUES (?)
+    `).run(phone);
+
+    // Cyzora amounts are cents:
+    // KSh 100 = 10000 cents.
     const response = await fetch(
       "https://api.cyzora.co.ke/api/v1/charges",
       {
@@ -276,78 +358,119 @@ app.post("/api/payments/stk", async (req, res) => {
       }
     );
 
-    const data = await response.json();
+    let data;
 
-    if (!response.ok || !data.id || !data.reference) {
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+    // Cyzora can return a normal charge or a 202 response
+    // containing the charge inside data.charge.
+    const charge = data.charge || data;
+
+    if (!response.ok) {
       console.error("Cyzora charge error:", data);
 
-      return res.status(response.status === 429 ? 429 : 502).json({
-        error: data.error || "Cyzora could not start the M-Pesa payment."
+      // A 409 can mean the same idempotent request is still processing.
+      // A 429 should be retried later with the same order key.
+      if (response.status !== 409 && response.status !== 429) {
+        db.prepare(`
+          UPDATE payments
+          SET status = 'failed'
+          WHERE id = ? AND status = 'pending'
+        `).run(paymentId);
+      }
+
+      return res.status(
+        response.status === 429 ? 429 : 502
+      ).json({
+        error:
+          data.error ||
+          "Cyzora could not start the payment. Please try again."
       });
     }
 
-    // Save the pending order before granting any package access.
+    if (!charge.id || !charge.reference) {
+      console.error("Unexpected Cyzora response:", data);
+
+      // Leave the order pending because the webhook may still resolve it.
+      return res.status(202).json({
+        ok: true,
+        reference: orderReference,
+        status: "pending",
+        message:
+          "Your payment request is being processed. Please wait for confirmation."
+      });
+    }
+
+    // Do not overwrite status here.
+    // A webhook may already have changed it to paid.
     db.prepare(`
-      INSERT INTO payments (
-        checkout_request_id,
-        merchant_request_id,
-        phone,
-        amount,
-        package_code,
-        status,
-        provider,
-        cyzora_charge_id,
-        cyzora_reference
-      )
-      VALUES (?, ?, ?, ?, ?, 'pending', 'cyzora', ?, ?)
+      UPDATE payments
+      SET checkout_request_id = ?,
+          cyzora_charge_id = ?,
+          cyzora_reference = ?
+      WHERE id = ?
     `).run(
-      data.id,
-      data.reference,
-      phone,
-      pkg.amount,
-      packageCode,
-      data.id,
-      data.reference
+      charge.id,
+      charge.id,
+      charge.reference,
+      paymentId
     );
 
-    db.prepare(`
-      INSERT OR IGNORE INTO customers(phone) VALUES (?)
-    `).run(phone);
-
-    res.json({
+    return res.status(200).json({
       ok: true,
-      reference: data.reference,
+      reference: charge.reference,
+      status: charge.status || "pending",
       message:
         "M-Pesa prompt requested. Enter your PIN. Your package activates after Cyzora confirms payment."
     });
 
   } catch (error) {
     console.error("Payment initiation error:", error.message);
-    res.status(400).json({
-      error: error.message || "Could not start payment."
+
+    // Do not mark a network-error order as failed.
+    // Cyzora may have received the request and may still send a webhook.
+    return res.status(502).json({
+      error:
+        "We could not confirm the payment request. Please check payment status before trying again.",
+      reference: orderReference || null
     });
   }
 });
 
-// Check payment status using the reference returned by the server.
+// CHECK PAYMENT STATUS
 app.get("/api/payments/status/:reference", (req, res) => {
   const payment = db.prepare(`
-    SELECT cyzora_reference AS reference,
-           amount,
-           package_code,
-           status,
-           created_at
+    SELECT
+      cyzora_reference AS reference,
+      merchant_request_id,
+      amount,
+      package_code,
+      status,
+      created_at
     FROM payments
-    WHERE cyzora_reference = ?
-      AND provider = 'cyzora'
-  `).get(req.params.reference);
+    WHERE provider = 'cyzora'
+    AND (
+      cyzora_reference = ?
+      OR merchant_request_id = ?
+    )
+    LIMIT 1
+  `).get(
+    req.params.reference,
+    req.params.reference
+  );
 
   if (!payment) {
-    return res.status(404).json({ error: "Payment not found." });
+    return res.status(404).json({
+      error: "Payment not found."
+    });
   }
 
   res.json({
-    reference: payment.reference,
+    reference: payment.reference || payment.merchant_request_id,
     amount: payment.amount,
     currency: "KES",
     packageCode: payment.package_code,
@@ -355,34 +478,52 @@ app.get("/api/payments/status/:reference", (req, res) => {
   });
 });
 
-// Keep the old Safaricom callback for any older pending transactions.
+// OLD SAFARICOM CALLBACK - retained for older transactions
 app.post("/api/mpesa/callback", (req, res) => {
   try {
     const result = req.body?.Body?.stkCallback;
 
     if (!result) {
-      return res.json({ ResultCode: 0, ResultDesc: "Accepted" });
+      return res.json({
+        ResultCode: 0,
+        ResultDesc: "Accepted"
+      });
     }
 
     const payment = db.prepare(`
-      SELECT * FROM payments WHERE checkout_request_id = ?
+      SELECT * FROM payments
+      WHERE checkout_request_id = ?
     `).get(result.CheckoutRequestID);
 
     if (!payment || payment.provider === "cyzora") {
-      return res.json({ ResultCode: 0, ResultDesc: "Accepted" });
+      return res.json({
+        ResultCode: 0,
+        ResultDesc: "Accepted"
+      });
     }
 
     if (result.ResultCode === 0) {
       const items = result.CallbackMetadata?.Item || [];
-      const receipt = items.find(x => x.Name === "MpesaReceiptNumber")?.Value;
-      const paidAmount = Number(items.find(x => x.Name === "Amount")?.Value);
+
+      const receipt = items.find(
+        x => x.Name === "MpesaReceiptNumber"
+      )?.Value;
+
+      const paidAmount = Number(
+        items.find(x => x.Name === "Amount")?.Value
+      );
+
       const paidPhone = String(
         items.find(x => x.Name === "PhoneNumber")?.Value || ""
       );
 
-      if (paidAmount === payment.amount && paidPhone === payment.phone) {
+      if (
+        paidAmount === payment.amount &&
+        paidPhone === payment.phone
+      ) {
         const update = db.prepare(`
-          UPDATE payments SET status = 'paid', mpesa_receipt = ?
+          UPDATE payments
+          SET status = 'paid', mpesa_receipt = ?
           WHERE id = ? AND status = 'pending'
         `);
 
@@ -396,28 +537,44 @@ app.post("/api/mpesa/callback", (req, res) => {
               INSERT INTO entitlements
               (phone, package_code, analyses_total)
               VALUES (?, ?, ?)
-            `).run(payment.phone, payment.package_code, pkg.analyses);
+            `).run(
+              payment.phone,
+              payment.package_code,
+              pkg.analyses
+            );
           }
         }
       } else {
         db.prepare(`
-          UPDATE payments SET status = 'review' WHERE id = ?
+          UPDATE payments
+          SET status = 'review'
+          WHERE id = ?
         `).run(payment.id);
       }
     } else {
       db.prepare(`
-        UPDATE payments SET status = 'failed'
+        UPDATE payments
+        SET status = 'failed'
         WHERE id = ? AND status = 'pending'
       `).run(payment.id);
     }
 
-    res.json({ ResultCode: 0, ResultDesc: "Accepted" });
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Accepted"
+    });
+
   } catch (error) {
     console.error("Old M-Pesa callback error:", error.message);
-    res.json({ ResultCode: 0, ResultDesc: "Accepted" });
+
+    res.json({
+      ResultCode: 0,
+      ResultDesc: "Accepted"
+    });
   }
 });
 
+// ADMIN LOGIN
 app.post("/api/admin/login", async (req, res) => {
   const email = String(req.body.email || "").toLowerCase();
   const password = String(req.body.password || "");
@@ -440,24 +597,35 @@ app.post("/api/admin/login", async (req, res) => {
     { expiresIn: "2h" }
   );
 
-  res.json({ token, expiresIn: 7200 });
+  res.json({
+    token,
+    expiresIn: 7200
+  });
 });
 
+// ADMIN OVERVIEW
 app.get("/api/admin/overview", auth, adminOnly, (_req, res) => {
   const totals = db.prepare(`
     SELECT
       COUNT(*) AS transactions,
       COALESCE(
-        SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END), 0
+        SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END),
+        0
       ) AS grossCollected,
-      SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)
-        AS pendingPayments
+      SUM(
+        CASE WHEN status = 'pending' THEN 1 ELSE 0 END
+      ) AS pendingPayments
     FROM payments
   `).get();
 
   const recent = db.prepare(`
-    SELECT phone, amount, package_code, status,
-           mpesa_receipt, created_at
+    SELECT
+      phone,
+      amount,
+      package_code,
+      status,
+      mpesa_receipt,
+      created_at
     FROM payments
     ORDER BY id DESC
     LIMIT 50
@@ -466,25 +634,33 @@ app.get("/api/admin/overview", auth, adminOnly, (_req, res) => {
   res.json({ totals, recent });
 });
 
+// CUSTOMER ACCOUNT
 app.get("/api/account/:phone", (req, res) => {
   try {
     const phone = normalizePhone(req.params.phone);
 
     const packages = db.prepare(`
-      SELECT package_code, analyses_total, analyses_used,
-             expires_at, created_at
+      SELECT
+        package_code,
+        analyses_total,
+        analyses_used,
+        expires_at,
+        created_at
       FROM entitlements
       WHERE phone = ?
       ORDER BY id DESC
     `).all(phone);
 
     res.json({ packages });
+
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    res.status(400).json({
+      error: error.message
+    });
   }
 });
 
-// Descriptive statistics only; past outcomes do not predict future rounds.
+// ANALYSIS
 app.post("/api/analyze", (req, res) => {
   const values = Array.isArray(req.body.multipliers)
     ? req.body.multipliers.slice(-500)
@@ -492,7 +668,11 @@ app.post("/api/analyze", (req, res) => {
 
   const nums = values
     .map(Number)
-    .filter(n => Number.isFinite(n) && n >= 1 && n <= 100000);
+    .filter(n =>
+      Number.isFinite(n) &&
+      n >= 1 &&
+      n <= 100000
+    );
 
   if (nums.length < 5) {
     return res.status(400).json({
@@ -501,7 +681,9 @@ app.post("/api/analyze", (req, res) => {
   }
 
   const sorted = [...nums].sort((a, b) => a - b);
-  const mean = nums.reduce((a, b) => a + b, 0) / nums.length;
+
+  const mean =
+    nums.reduce((a, b) => a + b, 0) / nums.length;
 
   const median = sorted.length % 2
     ? sorted[(sorted.length - 1) / 2]
@@ -511,7 +693,10 @@ app.post("/api/analyze", (req, res) => {
       ) / 2;
 
   const bands = [
-    { label: "Below 2x", count: nums.filter(x => x < 2).length },
+    {
+      label: "Below 2x",
+      count: nums.filter(x => x < 2).length
+    },
     {
       label: "2x–under 5x",
       count: nums.filter(x => x >= 2 && x < 5).length
@@ -541,10 +726,15 @@ app.post("/api/analyze", (req, res) => {
   });
 });
 
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// HEALTH CHECK
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
 app.get("*", (_req, res) => {
-  res.sendFile(path.join(__dirname, "public", "index.html"));
+  res.sendFile(
+    path.join(__dirname, "public", "index.html")
+  );
 });
 
 const port = Number(process.env.PORT || 3000);
