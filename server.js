@@ -11,6 +11,10 @@ const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
+
+// IMPORTANT: Trust Render's reverse proxy.
+app.set("trust proxy", 1);
+
 const db = new Database(process.env.DB_PATH || "aviator.sqlite");
 
 db.pragma("journal_mode = WAL");
@@ -79,7 +83,7 @@ app.use("/api/", rateLimit({
 }));
 
 // CYZORA WEBHOOK
-// Verify the signature using the raw request body before parsing JSON.
+// Raw body is required for HMAC signature verification.
 app.post(
   "/api/cyzora/webhook",
   express.raw({ type: "application/json", limit: "100kb" }),
@@ -125,8 +129,6 @@ app.post(
         return res.status(200).json({ received: true });
       }
 
-      // Find the order using the charge ID, Cyzora reference,
-      // or our original account_ref/order reference.
       const findPayment = () => db.prepare(`
         SELECT * FROM payments
         WHERE provider = 'cyzora'
@@ -173,8 +175,8 @@ app.post(
           });
         }
 
-        // Only a pending order can become paid.
-        // This prevents duplicate webhooks granting packages twice.
+        // Only a pending payment can activate a package.
+        // This prevents duplicate webhook events granting packages twice.
         const result = db.prepare(`
           UPDATE payments
           SET status = 'paid', mpesa_receipt = ?
@@ -225,7 +227,7 @@ app.post(
   }
 );
 
-// Normal JSON parsing happens after the raw webhook route.
+// Parse normal JSON after the raw webhook route.
 app.use(express.json({ limit: "100kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
@@ -308,8 +310,7 @@ app.post("/api/payments/stk", async (req, res) => {
       "GW-" + Date.now() + "-" +
       crypto.randomBytes(4).toString("hex");
 
-    // Save the order BEFORE contacting Cyzora.
-    // This prevents a fast webhook arriving before the order exists.
+    // Save the order before contacting Cyzora.
     const insert = db.prepare(`
       INSERT INTO payments (
         merchant_request_id,
@@ -334,8 +335,7 @@ app.post("/api/payments/stk", async (req, res) => {
       VALUES (?)
     `).run(phone);
 
-    // Cyzora amounts are cents:
-    // KSh 100 = 10000 cents.
+    // Cyzora uses cents: KSh 100 = 10000 cents.
     const response = await fetch(
       "https://api.cyzora.co.ke/api/v1/charges",
       {
@@ -366,15 +366,11 @@ app.post("/api/payments/stk", async (req, res) => {
       data = {};
     }
 
-    // Cyzora can return a normal charge or a 202 response
-    // containing the charge inside data.charge.
     const charge = data.charge || data;
 
     if (!response.ok) {
       console.error("Cyzora charge error:", data);
 
-      // A 409 can mean the same idempotent request is still processing.
-      // A 429 should be retried later with the same order key.
       if (response.status !== 409 && response.status !== 429) {
         db.prepare(`
           UPDATE payments
@@ -395,7 +391,6 @@ app.post("/api/payments/stk", async (req, res) => {
     if (!charge.id || !charge.reference) {
       console.error("Unexpected Cyzora response:", data);
 
-      // Leave the order pending because the webhook may still resolve it.
       return res.status(202).json({
         ok: true,
         reference: orderReference,
@@ -405,8 +400,7 @@ app.post("/api/payments/stk", async (req, res) => {
       });
     }
 
-    // Do not overwrite status here.
-    // A webhook may already have changed it to paid.
+    // Do not overwrite status: a webhook may already have marked it paid.
     db.prepare(`
       UPDATE payments
       SET checkout_request_id = ?,
@@ -431,8 +425,7 @@ app.post("/api/payments/stk", async (req, res) => {
   } catch (error) {
     console.error("Payment initiation error:", error.message);
 
-    // Do not mark a network-error order as failed.
-    // Cyzora may have received the request and may still send a webhook.
+    // Keep uncertain network-error orders pending.
     return res.status(502).json({
       error:
         "We could not confirm the payment request. Please check payment status before trying again.",
@@ -731,6 +724,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+// WEBSITE FALLBACK
 app.get("*", (_req, res) => {
   res.sendFile(
     path.join(__dirname, "public", "index.html")
