@@ -1,1 +1,137 @@
 
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>GoalWise AI Owner Dashboard</title>
+<style>
+body{margin:0;padding:20px;background:#090b12;color:white;font-family:Arial,sans-serif}
+main{max-width:900px;margin:auto}
+.panel{background:#171b29;padding:20px;border-radius:14px;margin:15px 0}
+input,button{width:100%;padding:14px;margin:8px 0;border:0;border-radius:8px;box-sizing:border-box;font-size:16px}
+input{background:#252b3b;color:white}
+button{background:#8055df;color:white;font-weight:bold}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.stat{background:#252b3b;padding:16px;border-radius:10px}
+.stat strong{display:block;font-size:24px;margin-top:10px}
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;min-width:600px}
+td,th{padding:10px;border-bottom:1px solid #444;text-align:left}
+.hidden{display:none}
+#message{color:#ffd27a}
+</style>
+</head>
+<body>
+<main>
+<h1>GoalWise AI — Owner Dashboard</h1>
+<p>Private owner administration</p>
+
+<section id="login" class="panel">
+<h2>Owner Login</h2>
+<form id="loginForm">
+<input id="email" type="email" placeholder="Admin email" required>
+<input id="password" type="password" placeholder="Admin password" required>
+<button id="loginButton">Sign In</button>
+</form>
+<p id="message"></p>
+</section>
+
+<section id="dashboard" class="hidden">
+<div class="grid">
+<div class="stat">Gross collections<strong id="gross">KSh 0</strong></div>
+<div class="stat">Transactions<strong id="transactions">0</strong></div>
+<div class="stat">Pending payments<strong id="pending">0</strong></div>
+</div>
+
+<div class="panel">
+<h2>Recent Transactions</h2>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Phone</th><th>Amount</th><th>Package</th><th>Status</th><th>Receipt</th></tr></thead>
+<tbody id="rows"></tbody>
+</table>
+</div>
+<button id="refresh">Refresh</button>
+<button id="logout">Sign Out</button>
+</div>
+</section>
+</main>
+
+<script>
+let token=null;
+const el=id=>document.getElementById(id);
+
+function safe(value){
+return String(value??"").replace(/[&<>"']/g,c=>({
+"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+}[c]));
+}
+
+async function loadDashboard(){
+const r=await fetch("/api/admin/overview",{
+headers:{Authorization:"Bearer "+token}
+});
+const d=await r.json();
+if(!r.ok)throw Error(d.error||"Could not load dashboard.");
+
+el("gross").textContent="KSh "+Number(d.totals.grossCollected||0).toLocaleString();
+el("transactions").textContent=d.totals.transactions||0;
+el("pending").textContent=d.totals.pendingPayments||0;
+
+el("rows").innerHTML=(d.recent||[]).map(x=>`
+<tr>
+<td>${safe(x.phone)}</td>
+<td>KSh ${safe(x.amount)}</td>
+<td>${safe(x.package_code)}</td>
+<td>${safe(x.status)}</td>
+<td>${safe(x.mpesa_receipt||"—")}</td>
+</tr>`).join("");
+}
+
+el("loginForm").addEventListener("submit",async e=>{
+e.preventDefault();
+el("message").textContent="Signing in...";
+el("loginButton").disabled=true;
+try{
+const r=await fetch("/api/admin/login",{
+method:"POST",
+headers:{"Content-Type":"application/json"},
+body:JSON.stringify({
+email:el("email").value.trim(),
+password:el("password").value
+})
+});
+const d=await r.json();
+if(!r.ok)throw Error(d.error||"Login failed.");
+token=d.token;
+await loadDashboard();
+el("login").classList.add("hidden");
+el("dashboard").classList.remove("hidden");
+el("password").value="";
+}catch(err){
+token=null;
+el("message").textContent=err.message;
+}finally{
+el("loginButton").disabled=false;
+}
+});
+
+el("refresh").addEventListener("click",async()=>{
+try{await loadDashboard();}
+catch(e){el("message").textContent=e.message;signOut();}
+});
+
+function signOut(){
+token=null;
+el("dashboard").classList.add("hidden");
+el("login").classList.remove("hidden");
+el("password").value="";
+el("message").textContent="You have signed out.";
+}
+el("logout").addEventListener("click",signOut);
+</script>
+</body>
+</html>
