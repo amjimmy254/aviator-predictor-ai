@@ -8,7 +8,11 @@
 <title>Aviator Predictor AI</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
-<style>
+<style> /* REMOVE ADMIN LOGIN FROM PUBLIC HOMEPAGE */
+#admin,
+a[href="#admin"] {
+    display: none !important;
+}
 :root{--bg:#090b12;--panel:#121622;--text:#f4f6fb;--muted:#9ca6ba;--red:#ff405b;--gold:#ffbd59;--line:#293143;--green:#58d6a2}
 *{box-sizing:border-box}
 body{margin:0;background:radial-gradient(ellipse at 80% -10%,#3c1728 0,transparent 38%),var(--bg);color:var(--text);font-family:'DM Sans',sans-serif}
